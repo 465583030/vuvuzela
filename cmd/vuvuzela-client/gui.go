@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/davidlazar/go-crypto/encoding/base32"
-	"github.com/davidlazar/gocui"
+	"github.com/jroimartin/gocui"
 	log "github.com/sirupsen/logrus"
 
 	"vuvuzela.io/alpenhorn"
@@ -69,7 +69,7 @@ func (gc *GuiClient) activateConvo(convo *Conversation) {
 
 var commands = map[string]func(*GuiClient, []string) error{
 	"quit": func(_ *GuiClient, _ []string) error {
-		return gocui.Quit
+		return gocui.ErrQuit
 	},
 
 	"list": func(gc *GuiClient, _ []string) error {
@@ -90,7 +90,6 @@ var commands = map[string]func(*GuiClient, []string) error{
 			}
 			tw.Flush()
 			fmt.Fprintf(mv, " ├─────────\n")
-			gc.gui.Flush()
 		}
 
 		outReqs := gc.alpenhornClient.GetOutgoingFriendRequests()
@@ -110,7 +109,6 @@ var commands = map[string]func(*GuiClient, []string) error{
 			}
 			tw.Flush()
 			fmt.Fprintf(mv, " ├─────────\n")
-			gc.gui.Flush()
 		}
 
 		friends := gc.alpenhornClient.GetFriends()
@@ -127,7 +125,6 @@ var commands = map[string]func(*GuiClient, []string) error{
 			tw.Flush()
 		}
 		fmt.Fprintf(mv, " └─────────\n")
-		gc.gui.Flush()
 
 		return nil
 	},
@@ -233,6 +230,8 @@ func (gc *GuiClient) handleLine(line string) error {
 }
 
 func (gc *GuiClient) tabComplete(_ *gocui.Gui, v *gocui.View) error {
+	// TODO sometimes the buffer contains an extra space at the end,
+	// so tab completion fails; see gocui issue #80.
 	line := strings.TrimRight(v.Buffer(), "\n")
 	if line == "" {
 		return nil
@@ -300,32 +299,38 @@ func (gc *GuiClient) readLine(_ *gocui.Gui, v *gocui.View) error {
 	return gc.handleLine(line)
 }
 
-func (gc *GuiClient) Flush() {
-	gc.gui.Flush()
+func (gc *GuiClient) redraw() {
+	gc.gui.Execute(func(gui *gocui.Gui) error {
+		return nil
+	})
 }
 
 func (gc *GuiClient) Warnf(format string, v ...interface{}) {
-	mv, err := gc.gui.View("main")
-	if err != nil {
-		return
-	}
-	fmt.Fprintf(mv, "-!- "+format, v...)
-	gc.gui.Flush()
+	gc.gui.Execute(func(gui *gocui.Gui) error {
+		mv, err := gui.View("main")
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(mv, "-!- "+format, v...)
+		return nil
+	})
 }
 
 func (gc *GuiClient) Printf(format string, v ...interface{}) {
-	mv, err := gc.gui.View("main")
-	if err != nil {
-		return
-	}
-	fmt.Fprintf(mv, format, v...)
-	gc.gui.Flush()
+	gc.gui.Execute(func(gui *gocui.Gui) error {
+		mv, err := gui.View("main")
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(mv, format, v...)
+		return nil
+	})
 }
 
 func (gc *GuiClient) layout(g *gocui.Gui) error {
 	maxX, maxY := g.Size()
 	if v, err := g.SetView("main", 0, -1, maxX-1, maxY-1); err != nil {
-		if err != gocui.ErrorUnkView {
+		if err != gocui.ErrUnknownView {
 			return err
 		}
 		v.Autoscroll = true
@@ -337,7 +342,7 @@ func (gc *GuiClient) layout(g *gocui.Gui) error {
 	}
 	sv, err := g.SetView("status", -1, maxY-3, maxX, maxY-1)
 	if err != nil {
-		if err != gocui.ErrorUnkView {
+		if err != gocui.ErrUnknownView {
 			return err
 		}
 		sv.Wrap = false
@@ -365,7 +370,7 @@ func (gc *GuiClient) layout(g *gocui.Gui) error {
 
 	pv, err := g.SetView("partner", -1, maxY-2, len(partner)+1, maxY)
 	if err != nil {
-		if err != gocui.ErrorUnkView {
+		if err != gocui.ErrUnknownView {
 			return err
 		}
 		pv.Wrap = false
@@ -381,13 +386,14 @@ func (gc *GuiClient) layout(g *gocui.Gui) error {
 	fmt.Fprintf(pv, "%s>", partner)
 
 	if v, err := g.SetView("input", len(partner)+1, maxY-2, maxX, maxY); err != nil {
-		if err != gocui.ErrorUnkView {
+		if err != gocui.ErrUnknownView {
 			return err
 		}
+		v.Editor = gocui.EditorFunc(vuvuzelaEditor)
 		v.Editable = true
 		v.Wrap = false
 		v.Frame = false
-		if err := g.SetCurrentView("input"); err != nil {
+		if _, err := g.SetCurrentView("input"); err != nil {
 			return err
 		}
 	}
@@ -396,7 +402,7 @@ func (gc *GuiClient) layout(g *gocui.Gui) error {
 }
 
 func quit(g *gocui.Gui, v *gocui.View) error {
-	return gocui.Quit
+	return gocui.ErrQuit
 }
 
 func (gc *GuiClient) Connect() {
@@ -413,12 +419,14 @@ func (gc *GuiClient) Connect() {
 }
 
 func (gc *GuiClient) Run() {
-	gui := gocui.NewGui()
-	if err := gui.Init(); err != nil {
+	gui, err := gocui.NewGui(gocui.OutputNormal)
+	if err != nil {
 		log.Panicln(err)
 	}
 	defer gui.Close()
 	gc.gui = gui
+
+	gui.SetManagerFunc(gc.layout)
 
 	if err := gui.SetKeybinding("", gocui.KeyCtrlC, gocui.ModNone, quit); err != nil {
 		log.Panicln(err)
@@ -429,10 +437,9 @@ func (gc *GuiClient) Run() {
 	if err := gui.SetKeybinding("input", gocui.KeyTab, gocui.ModNone, gc.tabComplete); err != nil {
 		log.Panicln(err)
 	}
-	gui.ShowCursor = true
+	gui.Cursor = true
 	gui.BgColor = gocui.ColorDefault
 	gui.FgColor = gocui.ColorDefault
-	gui.SetLayout(gc.layout)
 
 	gc.conversations = make(map[string]*Conversation)
 	// We need an active conversation to render the GUI
@@ -444,9 +451,8 @@ func (gc *GuiClient) Run() {
 		gc.Connect()
 	}()
 
-	gocui.Edit = vuvuzelaEditor
-	err := gui.MainLoop()
-	if err != nil && err != gocui.Quit {
+	err = gui.MainLoop()
+	if err != nil && err != gocui.ErrQuit {
 		log.Panicln(err)
 	}
 }
